@@ -4,6 +4,7 @@
 #include <imgui.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <cstring>
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -13,6 +14,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	char host[64] = "34.104.202.113";
 	char port[8] = "8001"; // 01_00・01_01のEcho用ポート
 	bool connected = false;
+	char text[1024] = "Hello";
+	char echo[1024] = {};
+	int sentBytes = 0;
+	int receivedBytes = 0;
+	int communicationError = 0;
+	const char* result = "Ready";
 
 	// 通信用ソケットを未接続の状態で用意する。
 	SOCKET tcpSocket = INVALID_SOCKET;
@@ -26,7 +33,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		Novice::BeginFrame();
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
-		ImGui::SetNextWindowSize(ImVec2(600, 200), ImGuiCond_Once);
+		ImGui::SetNextWindowSize(ImVec2(600, 300), ImGuiCond_Once);
 		ImGui::Begin("TCP Connection");
 		ImGui::BeginDisabled(connected);
 		ImGui::InputText("Host", host, sizeof(host));
@@ -68,6 +75,68 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		}
 		ImGui::EndDisabled();
 		ImGui::Text("Status: %s", connected ? "Connected" : "Not connected");
+		ImGui::Separator();
+		ImGui::InputText("Text", text, sizeof(text));
+		ImGui::BeginDisabled(!connected);
+		if (ImGui::Button("Send")) {
+			sentBytes = 0;
+			receivedBytes = 0;
+			communicationError = 0;
+			echo[0] = '\0';
+			const int length = static_cast<int>(std::strlen(text));
+			result = "Sending";
+
+			// sendは一度で全文を送るとは限らないので、残りを繰り返し送る。
+			while (sentBytes < length) {
+				const int count = send(tcpSocket, text + sentBytes,
+					length - sentBytes, 0);
+				if (count == SOCKET_ERROR) {
+					communicationError = WSAGetLastError();
+					result = "Send failed";
+					break;
+				}
+				if (count == 0) {
+					result = "Connection closed during send";
+					break;
+				}
+				sentBytes += count;
+			}
+
+			// Echoサーバーから、送信したバイト数と同じ量が戻るまで受信する。
+			if (sentBytes == length) {
+				while (receivedBytes < length) {
+					const int count = recv(tcpSocket, echo + receivedBytes,
+						length - receivedBytes, 0);
+					if (count == SOCKET_ERROR) {
+						communicationError = WSAGetLastError();
+						result = "Receive failed";
+						break;
+					}
+					if (count == 0) {
+						result = "Connection closed during receive";
+						break;
+					}
+					receivedBytes += count;
+				}
+			}
+			echo[receivedBytes] = '\0';
+			if (sentBytes == length && receivedBytes == length) {
+				result = std::strcmp(text, echo) == 0 ? "Echo matched" : "Echo mismatch";
+			} else {
+				// 通信に失敗した接続は閉じて、再接続できる状態にする。
+				closesocket(tcpSocket);
+				tcpSocket = INVALID_SOCKET;
+				connected = false;
+			}
+		}
+		ImGui::EndDisabled();
+		ImGui::Text("Echo: %s", echo);
+		ImGui::Text("Sent: %d bytes / Received: %d bytes", sentBytes, receivedBytes);
+		ImGui::Text("Total: %d bytes", sentBytes + receivedBytes);
+		ImGui::Text("Result: %s", result);
+		if (communicationError != 0) {
+			ImGui::Text("Winsock error: %d", communicationError);
+		}
 		ImGui::End();
 #endif
 		Novice::EndFrame();
