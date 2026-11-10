@@ -8,14 +8,44 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
+// TCPでは1回で全量を送受信できるとは限らないため、残りを繰り返す。
+bool SendAll(SOCKET socket, const char* data, int length, int& total, int& error) {
+	int offset = 0;
+	while (offset < length) {
+		const int count = send(socket, data + offset, length - offset, 0);
+		if (count == SOCKET_ERROR) {
+			error = WSAGetLastError();
+			return false;
+		}
+		if (count == 0) { return false; }
+		offset += count;
+		total += count;
+	}
+	return true;
+}
+
+bool ReceiveAll(SOCKET socket, char* data, int length, int& total, int& error) {
+	int offset = 0;
+	while (offset < length) {
+		const int count = recv(socket, data + offset, length - offset, 0);
+		if (count == SOCKET_ERROR) {
+			error = WSAGetLastError();
+			return false;
+		}
+		if (count == 0) { return false; } // 相手が切断した。
+		offset += count;
+		total += count;
+	}
+	return true;
+}
 // Windowsアプリのmain関数。ImGuiを使うため、Debugで実行する。
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	Novice::Initialize("NT1_01_00", 640, 360);
 	char host[64] = "34.104.202.113";
-	char port[8] = "8001"; // 01_00・01_01のEcho用ポート
+	char port[8] = "8000"; // ヘッダー付き通信のポート
 	bool connected = false;
 	char text[1024] = "Hello";
-	char echo[1024] = {};
+	char reply[4096] = {};
 	int sentBytes = 0;
 	int receivedBytes = 0;
 	int communicationError = 0;
@@ -56,6 +86,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 					}
 					if (connect(tcpSocket, address->ai_addr,
 						static_cast<int>(address->ai_addrlen)) == 0) {
+						// 応答が来ない場合も無期限に待たず、エラーとして扱う。
+						DWORD timeoutMs = 5000;
+						setsockopt(tcpSocket, SOL_SOCKET, SO_RCVTIMEO,
+							reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+						setsockopt(tcpSocket, SOL_SOCKET, SO_SNDTIMEO,
+							reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 						connected = true;
 						break;
 					}
@@ -82,55 +118,59 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			sentBytes = 0;
 			receivedBytes = 0;
 			communicationError = 0;
-			echo[0] = '\0';
+			reply[0] = '\0';
 			const int length = static_cast<int>(std::strlen(text));
-			result = "Sending";
 
-			// sendは一度で全文を送るとは限らないので、残りを繰り返し送る。
-			while (sentBytes < length) {
-				const int count = send(tcpSocket, text + sentBytes,
-					length - sentBytes, 0);
-				if (count == SOCKET_ERROR) {
-					communicationError = WSAGetLastError();
-					result = "Send failed";
-					break;
-				}
-				if (count == 0) {
-					result = "Connection closed during send";
-					break;
-				}
-				sentBytes += count;
-			}
+			// 4バイトヘッダー: 本文長の下位・上位バイト、Text種別1、0。
+			// このサーバーは下位バイトから送る形式。構造体の配置には依存しない。
+			char frame[4 + sizeof(text)] = {};
+			frame[0] = static_cast<char>(length & 0xFF);
+			frame[1] = static_cast<char>((length >> 8) & 0xFF);
+			frame[2] = 1;
+			frame[3] = 0;
+			std::memcpy(frame + 4, text, length);
 
-			// Echoサーバーから、送信したバイト数と同じ量が戻るまで受信する。
-			if (sentBytes == length) {
-				while (receivedBytes < length) {
-					const int count = recv(tcpSocket, echo + receivedBytes,
-						length - receivedBytes, 0);
-					if (count == SOCKET_ERROR) {
-						communicationError = WSAGetLastError();
-						result = "Receive failed";
-						break;
+			bool success = SendAll(tcpSocket, frame, 4 + length,
+				sentBytes, communicationError);
+			result = success ? "Receiving header" : "Send failed / disconnected";
+
+			unsigned char header[4] = {};
+			if (success) {
+				success = ReceiveAll(tcpSocket, reinterpret_cast<char*>(header), 4,
+					receivedBytes, communicationError);
+				if (!success) { result = "Header receive failed / disconnected"; }
+			}
+			if (success) {
+				const int bodyLength = static_cast<int>(header[0]) |
+					(static_cast<int>(header[1]) << 8);
+				// 終端文字の1バイトを確保し、異常な長さは受信前に拒否する。
+				if (bodyLength >= static_cast<int>(sizeof(reply))) {
+					success = false;
+					result = "Reply body too large";
+				} else {
+					success = ReceiveAll(tcpSocket, reply, bodyLength,
+						receivedBytes, communicationError);
+					if (!success) {
+						reply[0] = '\0';
+						result = "Body receive failed / disconnected";
+					} else if (header[2] != 1 || header[3] != 0) {
+						// 本文は消費済みなので、次のフレームも正しく読める。
+						reply[0] = '\0';
+						result = "Received a non-Text frame";
+					} else {
+						reply[bodyLength] = '\0';
+						result = "Text frame received";
 					}
-					if (count == 0) {
-						result = "Connection closed during receive";
-						break;
-					}
-					receivedBytes += count;
 				}
 			}
-			echo[receivedBytes] = '\0';
-			if (sentBytes == length && receivedBytes == length) {
-				result = std::strcmp(text, echo) == 0 ? "Echo matched" : "Echo mismatch";
-			} else {
-				// 通信に失敗した接続は閉じて、再接続できる状態にする。
+			if (!success) {
 				closesocket(tcpSocket);
 				tcpSocket = INVALID_SOCKET;
 				connected = false;
 			}
 		}
 		ImGui::EndDisabled();
-		ImGui::Text("Echo: %s", echo);
+		ImGui::TextWrapped("Reply: %s", reply);
 		ImGui::Text("Sent: %d bytes / Received: %d bytes", sentBytes, receivedBytes);
 		ImGui::Text("Total: %d bytes", sentBytes + receivedBytes);
 		ImGui::Text("Result: %s", result);
