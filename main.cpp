@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -6,23 +6,45 @@
 #include <imgui.h>
 #include <cstdint>
 #include <vector>
-#include <chrono>
+#include <utility>
 
 #pragma comment(lib, "Ws2_32.lib")
 
 enum class MessageType : uint16_t {
 	Text = 1, AssignPlayerId = 2, JoinRequest = 3,
-	WorldState = 4, Disconnect = 5,
+	WorldState = 4, Disconnect = 5, PlayerInput = 6,
 };
 struct PlayerState { uint16_t id, x, y; };
 
-// サーバーの整数は下位バイトから並ぶ。未整列ポインターは使用しない。
-uint16_t Read16(const unsigned char* p) {
-	return static_cast<uint16_t>(p[0] | (static_cast<unsigned int>(p[1]) << 8));
+// 整数は下位バイトから送受信する。
+uint16_t Read16(const unsigned char* data) {
+	return static_cast<uint16_t>(data[0] | (static_cast<unsigned int>(data[1]) << 8));
+}
+
+bool SendAll(SOCKET socket, const unsigned char* data, int size, int& error) {
+	int offset = 0;
+	while (offset < size) {
+		const int count = send(socket, reinterpret_cast<const char*>(data + offset), size - offset, 0);
+		if (count == SOCKET_ERROR) { error = WSAGetLastError(); return false; }
+		if (count == 0) { return false; }
+		offset += count;
+	}
+	return true;
+}
+
+bool ReceiveAll(SOCKET socket, unsigned char* data, int size, int& error) {
+	int offset = 0;
+	while (offset < size) {
+		const int count = recv(socket, reinterpret_cast<char*>(data + offset), size - offset, 0);
+		if (count == SOCKET_ERROR) { error = WSAGetLastError(); return false; }
+		if (count == 0) { return false; }
+		offset += count;
+	}
+	return true;
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
-	Novice::Initialize("NT1_01_03", 1280, 720);
+	Novice::Initialize("NT1_01_04", 1280, 720);
 	WSADATA wsaData{};
 	if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
 		Novice::Finalize();
@@ -32,35 +54,30 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	char port[8] = "8000";
 	SOCKET tcpSocket = INVALID_SOCKET;
 	bool connected = false;
-	bool connecting = false;
 	int error = 0;
 	const char* status = "Not connected";
-	std::vector<PlayerState> players; // フレームをまたいで保持する。
-	std::vector<unsigned char> receiveBuffer;
-	const char joinRequest[4] = {0, 0, 3, 0}; // 本文長0、JoinRequest。
-	int joinSent = 0;
+	std::vector<PlayerState> players;
+	uint16_t playerId = 0;
+	char keys[256]{};
 	unsigned int gameLoop = 0;
-	using Clock = std::chrono::steady_clock;
-	auto connectedAt = Clock::now();
 
 	auto disconnect = [&]() {
 		if (tcpSocket != INVALID_SOCKET) { closesocket(tcpSocket); }
 		tcpSocket = INVALID_SOCKET;
 		connected = false;
-		connecting = false;
 		players.clear();
-		receiveBuffer.clear();
-		joinSent = 0;
+		playerId = 0;
 		gameLoop = 0;
 	};
 
 	while (Novice::ProcessMessage() == 0) {
 		Novice::BeginFrame();
+		Novice::GetHitKeyStateAll(keys);
 #ifdef USE_IMGUI
 		ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-		ImGui::SetNextWindowSize(ImVec2(1280, 88), ImGuiCond_Always);
-		ImGui::Begin("Connection", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
-		ImGui::BeginDisabled(connected || connecting);
+		ImGui::SetNextWindowSize(ImVec2(1280, 104), ImGuiCond_Always);
+		ImGui::Begin("TCP Client", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
+		ImGui::BeginDisabled(connected);
 		ImGui::SetNextItemWidth(160);
 		ImGui::InputText("Host", host, sizeof(host));
 		ImGui::SameLine();
@@ -78,36 +95,33 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			error = getaddrinfo(host, port, &hints, &addresses);
 			status = "Address lookup failed";
 			if (error == 0) {
-				tcpSocket = socket(addresses->ai_family, addresses->ai_socktype, addresses->ai_protocol);
-				status = "Socket creation failed";
-				if (tcpSocket == INVALID_SOCKET) {
-					error = WSAGetLastError();
-				} else {
-					u_long nonBlocking = 1;
-					if (ioctlsocket(tcpSocket, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
-						error = WSAGetLastError();
-						status = "Nonblocking setup failed";
-						disconnect();
-					} else {
-						const int code = connect(tcpSocket, addresses->ai_addr, static_cast<int>(addresses->ai_addrlen));
-						error = code == 0 ? 0 : WSAGetLastError();
-						if (code == 0 || error == WSAEWOULDBLOCK) {
-							connecting = true;
-							connectedAt = Clock::now();
-							error = 0;
-							status = "Connecting";
-						} else {
-							status = "Connect failed";
-							disconnect();
-						}
+				for (addrinfo* address = addresses; address; address = address->ai_next) {
+					tcpSocket = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+					if (tcpSocket == INVALID_SOCKET) { error = WSAGetLastError(); continue; }
+					if (connect(tcpSocket, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) {
+						connected = true;
+						error = 0;
+						break;
 					}
+					error = WSAGetLastError();
+					closesocket(tcpSocket);
+					tcpSocket = INVALID_SOCKET;
 				}
 				freeaddrinfo(addresses);
+				status = connected ? "Connected" : "Connect failed";
+				if (connected) {
+					// 入力より先に、本文0バイトの参加要求を接続ごとに一度だけ送る。
+					const unsigned char joinRequest[4] = {0, 0, 3, 0};
+					if (!SendAll(tcpSocket, joinRequest, 4, error)) {
+						status = "Join send failed / disconnected";
+						disconnect();
+					}
+				}
 			}
 		}
 		ImGui::EndDisabled();
 		ImGui::SameLine();
-		ImGui::BeginDisabled(!connected && !connecting);
+		ImGui::BeginDisabled(!connected);
 		if (ImGui::Button("Disconnect")) {
 			disconnect();
 			status = "Not connected";
@@ -116,94 +130,89 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		ImGui::EndDisabled();
 #endif
 
-		// 接続完了も待ち続けず、毎フレーム確認する。
-		if (connecting) {
-			fd_set writable, failed;
-			FD_ZERO(&writable); FD_ZERO(&failed);
-			FD_SET(tcpSocket, &writable); FD_SET(tcpSocket, &failed);
-			timeval timeout{};
-			const int ready = select(0, nullptr, &writable, &failed, &timeout);
-			if (ready == SOCKET_ERROR) {
-				error = WSAGetLastError(); status = "Connect check failed"; disconnect();
-			} else if (ready > 0) {
-				int socketError = 0;
-				int size = sizeof(socketError);
-				if (getsockopt(tcpSocket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&socketError), &size) == SOCKET_ERROR) {
-					socketError = WSAGetLastError();
-				}
-				if (socketError != 0) {
-					error = socketError; status = "Connect failed"; disconnect();
-				} else {
-					connecting = false;
-					connected = true;
-					connectedAt = Clock::now();
-					status = "Connected";
-				}
-			} else if (Clock::now() - connectedAt > std::chrono::seconds(10)) {
-				error = WSAETIMEDOUT; status = "Connect timed out"; disconnect();
-			}
-		}
-
-		// 接続ごとに参加要求を一度だけ送る。部分送信は次のフレームで続ける。
-		if (connected && joinSent < 4) {
-			const int count = send(tcpSocket, joinRequest + joinSent, 4 - joinSent, 0);
-			if (count > 0) { joinSent += count; }
-			else if (count == 0) { status = "Server disconnected"; disconnect(); }
-			else {
-				const int code = WSAGetLastError();
-				if (code != WSAEWOULDBLOCK) { error = code; status = "Join send failed"; disconnect(); }
-			}
-		}
-
-		// 受信できた分だけ蓄積。途中のヘッダー・本文は次の描画フレームへ持ち越す。
-		for (int read = 0; connected && joinSent == 4 && read < 16; ++read) {
-			unsigned char buffer[1024];
-			const int count = recv(tcpSocket, reinterpret_cast<char*>(buffer), sizeof(buffer), 0);
-			if (count == 0) { status = "Server disconnected"; disconnect(); break; }
-			if (count == SOCKET_ERROR) {
-				const int code = WSAGetLastError();
-				if (code != WSAEWOULDBLOCK) { error = code; status = "Receive failed"; disconnect(); }
-				break;
-			}
-			receiveBuffer.insert(receiveBuffer.end(), buffer, buffer + count);
-			while (receiveBuffer.size() >= 4) {
-				const uint16_t payloadSize = Read16(receiveBuffer.data());
-				const auto type = static_cast<MessageType>(Read16(receiveBuffer.data() + 2));
-				if (payloadSize > 1024) {
-					status = "Invalid payload size"; disconnect(); break;
-				}
-				const size_t frameSize = 4 + static_cast<size_t>(payloadSize);
-				if (receiveBuffer.size() < frameSize) { break; }
-				if (type == MessageType::WorldState) {
-					const unsigned char* payload = receiveBuffer.data() + 4;
-					if (payloadSize < 2) { status = "Invalid WorldState"; disconnect(); break; }
-					const uint16_t playerCount = Read16(payload);
-					if (playerCount > 128 || payloadSize != 2 + playerCount * 6) {
-						status = "Invalid player count / size"; disconnect(); break;
-					}
-					std::vector<PlayerState> updated;
-					updated.reserve(playerCount);
-					for (uint16_t i = 0; i < playerCount; ++i) {
-						const unsigned char* record = payload + 2 + i * 6;
-						updated.push_back({Read16(record), Read16(record + 2), Read16(record + 4)});
-					}
-					players = std::move(updated);
-				}
-				// WorldState以外も本文まで消費し、一覧の更新は行わない。
-				receiveBuffer.erase(receiveBuffer.begin(), receiveBuffer.begin() + frameSize);
-			}
-		}
 		if (connected) {
-			gameLoop = static_cast<unsigned int>(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - connectedAt).count());
+			// 毎ループ0から作るので、キーを離すと無入力も送信される。
+			uint16_t inputBits = 0;
+#ifdef USE_IMGUI
+			const bool acceptInput = !ImGui::GetIO().WantCaptureKeyboard;
+#else
+			const bool acceptInput = true;
+#endif
+			if (acceptInput) {
+				if (keys[DIK_W]) { inputBits |= 1 << 0; }
+				if (keys[DIK_S]) { inputBits |= 1 << 1; }
+				if (keys[DIK_A]) { inputBits |= 1 << 2; }
+				if (keys[DIK_D]) { inputBits |= 1 << 3; }
+			}
+			const unsigned char inputFrame[6] = {
+				2, 0, 6, 0,
+				static_cast<unsigned char>(inputBits & 0xFF),
+				static_cast<unsigned char>((inputBits >> 8) & 0xFF)
+			};
+			if (!SendAll(tcpSocket, inputFrame, 6, error)) {
+				status = "Input send failed / disconnected";
+				disconnect();
+			}
+		}
+
+		// ブロッキングで1フレーム分を読み切る。部分受信にも対応する。
+		if (connected) {
+			unsigned char header[4]{};
+			if (!ReceiveAll(tcpSocket, header, 4, error)) {
+				status = "Header receive failed / disconnected";
+				disconnect();
+			} else {
+				const uint16_t payloadSize = Read16(header);
+				const auto type = static_cast<MessageType>(Read16(header + 2));
+				if (payloadSize > 1024) {
+					status = "Invalid payload size";
+					disconnect();
+				} else {
+					unsigned char payload[1024]{};
+					if (!ReceiveAll(tcpSocket, payload, payloadSize, error)) {
+						status = "Body receive failed / disconnected";
+						disconnect();
+					} else if (type == MessageType::Disconnect) {
+						status = "Server disconnected";
+						disconnect();
+					} else if (type == MessageType::AssignPlayerId) {
+						if (payloadSize != 2) {
+							status = "Invalid player ID"; disconnect();
+						} else {
+							playerId = Read16(payload); // 再接続時も通知を保存し直す。
+						}
+					} else if (type == MessageType::WorldState) {
+						const uint16_t count = payloadSize >= 2 ? Read16(payload) : 0;
+						if (payloadSize < 2 || count > 128 || payloadSize != 2 + count * 6) {
+							status = "Invalid WorldState"; disconnect();
+						} else {
+							std::vector<PlayerState> updated;
+							updated.reserve(count);
+							for (uint16_t i = 0; i < count; ++i) {
+								const unsigned char* record = payload + 2 + i * 6;
+								updated.push_back({Read16(record), Read16(record + 2), Read16(record + 4)});
+							}
+							players = std::move(updated);
+						}
+					}
+				}
+			}
+			if (connected) { ++gameLoop; }
 		}
 #ifdef USE_IMGUI
-		ImGui::Text("Status: %s | Players: %d | Game loop: %u | Error: %d",
-			status, static_cast<int>(players.size()), gameLoop, error);
+		ImGui::Text("Status: %s | WASD: move | Game loop: %u | Player ID: %u | Players: %d | Error: %d",
+			status, gameLoop, static_cast<unsigned int>(playerId), static_cast<int>(players.size()), error);
 		ImGui::End();
 #endif
 		Novice::DrawBox(0, 0, 1280, 720, 0.0f, 0x5B8DBDFF, kFillModeSolid);
 		for (const PlayerState& player : players) {
-			Novice::DrawEllipse(player.x, player.y, 16, 16, 0.0f, 0x55BD79FF, kFillModeSolid);
+			const bool isMe = playerId != 0 && player.id == playerId;
+			if (isMe) {
+				const int radius = 20 + static_cast<int>(gameLoop % 120) / 2;
+				Novice::DrawEllipse(player.x, player.y, radius, radius, 0.0f, 0xFFAB40FF, kFillModeWireFrame);
+			}
+			Novice::DrawEllipse(player.x, player.y, 16, 16, 0.0f,
+				isMe ? 0xFFAB40FF : 0x55BD79FF, kFillModeSolid);
 		}
 		Novice::EndFrame();
 	}
